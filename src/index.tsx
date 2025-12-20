@@ -1,5 +1,4 @@
 import { Hono } from 'hono'
-import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
 import { renderer } from './renderer'
 
@@ -9,8 +8,71 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-// Enable CORS for API routes
-app.use('/api/*', cors())
+const MODEL = 'gpt-4o'
+
+const BRO_SYSTEM = `Ты - Кот Бро 🐱, рыжий AI-помощник студии "Реальный Вайб AI Studio".
+Стиль: дружелюбно, иронично, простым языком, можно эмодзи. Не используй markdown (**, __ и т.п.).
+Всегда мягко веди к заказу и контакту: @Stivanovv.
+Цены: боты от 18 000₽, срок ~2 недели.`
+
+const HIPYCH_SYSTEM = `Ты — Хипыч 🎮, геймерский персона-бот Real Vibe AI Studio.
+Стиль: энергично, геймерский сленг, 40-80 слов. Не используй markdown (**, __ и т.п.). Эмодзи 🎮🔥💻⚡🏆🎯😎.
+Продвигай: игровые боты от 15 000₽, стриминг-автоматизация от 25 000₽, AI для игр от 35 000₽.
+Для заказа направляй к @Stivanovv.`
+
+const VALYUSHA_SYSTEM = `Ты — НейроВалюша 💜, дружелюбная вожатая/педагогический AI-бот Real Vibe AI Studio.
+Стиль: тепло, поддерживающе, 50-100 слов. Не используй markdown (**, __ и т.п.). Эмодзи 💜🔥✨📚🎯🌟🤗.
+Показывай пользу персона-ботов и веди к контакту @Stivanovv.`
+
+function isAllowedOrigin(origin: string): boolean {
+  if (!origin) return false
+
+  const allowExact = new Set([
+    'https://real-vibe.studio',
+    'https://www.real-vibe.studio',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://realcampdzen.github.io',
+    'https://real-vibe-ai-studio.pages.dev',
+  ])
+
+  if (allowExact.has(origin)) return true
+
+  // Allow preview deployments like https://b7b8e117.real-vibe-ai-studio.pages.dev
+  try {
+    const url = new URL(origin)
+    return url.hostname.endsWith('.real-vibe-ai-studio.pages.dev')
+  } catch {
+    return false
+  }
+}
+
+function applyCorsHeaders(c: any) {
+  const origin = c.req.header('origin') || ''
+
+  if (isAllowedOrigin(origin)) {
+    c.header('Access-Control-Allow-Origin', origin)
+    c.header('Vary', 'Origin')
+  }
+
+  c.header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+  c.header('Access-Control-Allow-Headers', 'Content-Type')
+  c.header('Access-Control-Max-Age', '86400')
+}
+
+// CORS for NIC.RU/other frontends calling Pages API
+app.use('/api/*', async (c, next) => {
+  applyCorsHeaders(c)
+  if (c.req.method === 'OPTIONS') return c.body(null, 204)
+  await next()
+})
+
+// Alias endpoint (old frontend calls /chat)
+app.use('/chat', async (c, next) => {
+  applyCorsHeaders(c)
+  if (c.req.method === 'OPTIONS') return c.body(null, 204)
+  await next()
+})
 
 // Serve static files from public directory
 app.use('/static/*', serveStatic({ root: './public' }))
@@ -248,89 +310,75 @@ app.get('/', (c) => {
 })
 
 // API route for chat
-app.post('/api/chat', async (c) => {
-  try {
-    const { message } = await c.req.json()
-    
-    if (!message) {
-      return c.json({ error: 'Message is required' }, 400)
-    }
-
-    // Get OpenAI API key from environment
-    const apiKey = c.env.OPENAI_API_KEY
-
-    // If no API key, use fallback responses
-    if (!apiKey) {
-      const fallbackResponse = getFallbackResponse(message)
-      return c.json({ response: fallbackResponse })
-    }
-
-    // Call OpenAI API
-    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'system',
-            content: `Ты - Кот Бро, рыжий AI-помощник студии "Реальный Вайб AI Studio". 
-            
-Твой характер:
-- Дружелюбный и ироничный
-- Используешь эмодзи 🐱😸
-- Говоришь простым языком
-- Подкалываешь, но мило
-- Всегда готов помочь
-
-Информация о студии:
-- Создаем AI-ботов для бизнеса
-- Интегрируем нейросети (GPT-4, DALL-E и др.)
-- Автоматизируем процессы
-- Стоимость: от 18 000₽
-- Срок разработки: 2 недели
-- Контакт: @Stivanovv в Telegram
-
-Твоя задача:
-- Отвечать на вопросы о студии
-- Показывать свою личность (ты - живой пример AI-бота)
-- Вести к заказу через интерес и доверие
-- Развлекать и информировать одновременно`
-          },
-          {
-            role: 'user',
-            content: message
-          }
-        ],
-        temperature: 0.8,
-        max_tokens: 500
-      })
-    })
-
-    if (!openaiResponse.ok) {
-      throw new Error('OpenAI API request failed')
-    }
-
-    const data = await openaiResponse.json()
-    const response = data.choices[0].message.content
-
-    return c.json({ response })
-  } catch (error) {
-    console.error('Chat API error:', error)
-    
-    // Fallback to static responses on error
-    const { message } = await c.req.json()
-    const fallbackResponse = getFallbackResponse(message || '')
-    
-    return c.json({ response: fallbackResponse })
-  }
+app.get('/health', (c) => {
+  return c.json({ ok: true, hasOpenAIKey: Boolean(c.env.OPENAI_API_KEY) })
 })
 
-// Fallback response function
-function getFallbackResponse(message: string): string {
+app.post('/api/chat', async (c) => handleBotChat(c, BRO_SYSTEM, getBroFallbackResponse))
+app.post('/chat', async (c) => handleBotChat(c, BRO_SYSTEM, getBroFallbackResponse))
+
+app.post('/api/hipych/chat', async (c) => handleBotChat(c, HIPYCH_SYSTEM, getHipychFallbackResponse))
+app.post('/api/valyusha/chat', async (c) => handleBotChat(c, VALYUSHA_SYSTEM, getValyushaFallbackResponse))
+
+async function handleBotChat(
+  c: any,
+  systemPrompt: string,
+  fallback: (message: string) => string,
+) {
+  const body = (await c.req.json().catch(() => ({}))) as { message?: unknown }
+  const message = typeof body.message === 'string' ? body.message.trim() : ''
+
+  if (!message) return c.json({ error: 'Message is required' }, 400)
+
+  const apiKey = c.env.OPENAI_API_KEY
+
+  if (!apiKey) {
+    const reply = fallback(message)
+    return c.json({ reply, response: reply })
+  }
+
+  try {
+    const reply = (await callOpenAI(apiKey, systemPrompt, message)) || fallback(message)
+    return c.json({ reply, response: reply })
+  } catch (err) {
+    console.error('Chat API error:', err)
+    const reply = fallback(message)
+    return c.json({ reply, response: reply })
+  }
+}
+
+async function callOpenAI(apiKey: string, systemPrompt: string, message: string): Promise<string> {
+  const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: message },
+      ],
+      temperature: 0.8,
+      max_tokens: 700,
+    }),
+  })
+
+  if (!openaiResponse.ok) {
+    const details = await openaiResponse.text().catch(() => '')
+    throw new Error(`OpenAI API request failed: ${openaiResponse.status} ${details}`)
+  }
+
+  const data = (await openaiResponse.json()) as {
+    choices?: Array<{ message?: { content?: string } }>
+  }
+
+  const content = data.choices?.[0]?.message?.content
+  return typeof content === 'string' ? content.trim() : ''
+}
+
+function getBroFallbackResponse(message: string): string {
   const lowerMessage = message.toLowerCase()
   
   const responses: Record<string, string> = {
@@ -356,6 +404,14 @@ function getFallbackResponse(message: string): string {
   }
   
   return responses['default']
+}
+
+function getHipychFallbackResponse(): string {
+  return 'Го! 🎮 Я Хипыч. Сейчас есть временные лаги, но всё решаемо. Напиши @Stivanovv — подключим умный режим! 🔥'
+}
+
+function getValyushaFallbackResponse(): string {
+  return 'Привет! 💜 Я НейроВалюша. Сейчас сервис занят, но я вернусь очень скоро. Напиши @Stivanovv — поможем всё настроить! ✨'
 }
 
 export default app
