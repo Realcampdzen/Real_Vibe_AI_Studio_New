@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { serveStatic } from 'hono/cloudflare-workers'
+import { serveStatic } from 'hono/cloudflare-pages'
 import { renderer } from './renderer'
 
 type Bindings = {
@@ -75,7 +75,7 @@ app.use('/chat', async (c, next) => {
 })
 
 // Serve static files from public directory
-app.use('/static/*', serveStatic({ root: './public' }))
+app.use('/static/*', serveStatic())
 
 // Use renderer for HTML pages
 app.use(renderer)
@@ -325,6 +325,8 @@ async function handleBotChat(
   systemPrompt: string,
   fallback: (message: string) => string,
 ) {
+  const debug = c.req.query('debug') === '1'
+
   const body = (await c.req.json().catch(() => ({}))) as { message?: unknown }
   const message = typeof body.message === 'string' ? body.message.trim() : ''
 
@@ -343,6 +345,18 @@ async function handleBotChat(
   } catch (err) {
     console.error('Chat API error:', err)
     const reply = fallback(message)
+
+    // Optional debug info (do not enable by default in the frontend)
+    if (debug) {
+      return c.json({
+        reply,
+        response: reply,
+        debug: {
+          openaiError: String((err as any)?.message || err),
+        },
+      })
+    }
+
     return c.json({ reply, response: reply })
   }
 }
