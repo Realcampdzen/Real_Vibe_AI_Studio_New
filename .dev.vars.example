@@ -1,0 +1,18 @@
+# Локальные переменные окружения для `wrangler pages dev`
+# Скопируйте в `.dev.vars` и подставьте значения.
+
+# OpenAI (опционально; если не задан — будет fallback)
+OPENAI_API_KEY=your_openai_api_key_here
+
+# VK (Callback API)
+VK_GROUP_ID=123456
+VK_SECRET=your_vk_callback_secret
+VK_CONFIRMATION_CODE=your_vk_confirmation_code
+VK_ACCESS_TOKEN=your_vk_community_access_token
+
+# Telegram
+TELEGRAM_BOT_TOKEN=123456:ABCDEF_your_bot_token
+TELEGRAM_WEBHOOK_SECRET=your_webhook_secret_token
+# TELEGRAM_CHANNEL_ID=-1001234567890
+
+

@@ -1,12 +1,18 @@
 import { Hono } from 'hono'
 import { serveStatic } from 'hono/cloudflare-pages'
 import { renderer } from './renderer'
+import {
+  getVkConfirmationResponse,
+  isValidTelegramRequest,
+  isValidVkRequest,
+  processTelegramUpdate,
+  processVkCallbackEvent,
+  type NeuroValyushaBindings,
+} from './neurovalyusha/handlers'
+import { kvPutJson } from './neurovalyusha/kv'
+import { NEUROVALYUSHA_CHAT_SYSTEM } from './neurovalyusha/constants'
 
-type Bindings = {
-  OPENAI_API_KEY?: string;
-}
-
-const app = new Hono<{ Bindings: Bindings }>()
+const app = new Hono<{ Bindings: NeuroValyushaBindings }>()
 
 const MODEL = 'gpt-4o'
 
@@ -20,9 +26,7 @@ const HIPYCH_SYSTEM = `Ты — Хипыч 🎮, геймерский персо
 Продвигай: игровые боты от 15 000₽, стриминг-автоматизация от 25 000₽, AI для игр от 35 000₽.
 Для заказа направляй к @Stivanovv.`
 
-const VALYUSHA_SYSTEM = `Ты — НейроВалюша 💜, дружелюбная вожатая/педагогический AI-бот Real Vibe AI Studio.
-Стиль: тепло, поддерживающе, 50-100 слов. Не используй markdown (**, __ и т.п.). Эмодзи 💜🔥✨📚🎯🌟🤗.
-Показывай пользу персона-ботов и веди к контакту @Stivanovv.`
+const VALYUSHA_SYSTEM = NEUROVALYUSHA_CHAT_SYSTEM
 
 function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false
@@ -64,14 +68,14 @@ function applyCorsHeaders(c: any) {
 app.use('/api/*', async (c, next) => {
   applyCorsHeaders(c)
   if (c.req.method === 'OPTIONS') return c.body(null, 204)
-  await next()
+  return await next()
 })
 
 // Alias endpoint (old frontend calls /chat)
 app.use('/chat', async (c, next) => {
   applyCorsHeaders(c)
   if (c.req.method === 'OPTIONS') return c.body(null, 204)
-  await next()
+  return await next()
 })
 
 // Serve static files from public directory
@@ -311,7 +315,11 @@ app.get('/', (c) => {
 
 // API route for chat
 app.get('/health', (c) => {
-  return c.json({ ok: true, hasOpenAIKey: Boolean(c.env.OPENAI_API_KEY) })
+  return c.json({
+    ok: true,
+    hasOpenAIKey: Boolean(c.env.OPENAI_API_KEY),
+    hasKV: Boolean((c.env as any).NEUROVALYUSHA_KV),
+  })
 })
 
 app.post('/api/chat', async (c) => handleBotChat(c, BRO_SYSTEM, getBroFallbackResponse))
@@ -319,6 +327,112 @@ app.post('/chat', async (c) => handleBotChat(c, BRO_SYSTEM, getBroFallbackRespon
 
 app.post('/api/hipych/chat', async (c) => handleBotChat(c, HIPYCH_SYSTEM, getHipychFallbackResponse))
 app.post('/api/valyusha/chat', async (c) => handleBotChat(c, VALYUSHA_SYSTEM, getValyushaFallbackResponse))
+
+// VK Callback API webhook
+app.post('/api/vk/callback', async (c) => {
+  const payload = (await c.req.json().catch(() => null)) as any
+  if (!payload) return c.text('bad request', 400)
+
+  const confirmation = getVkConfirmationResponse(c.env, payload)
+  if (confirmation !== null) return c.text(confirmation)
+
+  if (!isValidVkRequest(c.env, payload)) {
+    const expectedGroupId = c.env.VK_GROUP_ID ? Number(c.env.VK_GROUP_ID) : null
+    const payloadGroupId = typeof payload?.group_id === 'number' ? payload.group_id : null
+    const hasSecretInPayload = typeof payload?.secret === 'string' && payload.secret.length > 0
+    const hasSecretInEnv = typeof c.env.VK_SECRET === 'string' && c.env.VK_SECRET.length > 0
+
+    let reason: string = 'invalid'
+    if (expectedGroupId && Number.isFinite(expectedGroupId) && payloadGroupId !== null && payloadGroupId !== expectedGroupId) {
+      reason = 'group_id_mismatch'
+    } else if (hasSecretInEnv && !hasSecretInPayload) {
+      reason = 'missing_secret'
+    } else if (hasSecretInEnv && hasSecretInPayload && payload.secret !== c.env.VK_SECRET) {
+      reason = 'secret_mismatch'
+    }
+
+    await kvPutJson(
+      (c.env as any).NEUROVALYUSHA_KV,
+      'nv:vk:lastForbidden',
+      {
+        ts: Date.now(),
+        reason,
+        type: payload?.type,
+        event_id: payload?.event_id,
+        payloadGroupId,
+        expectedGroupId,
+        hasSecretInPayload,
+      },
+      { ttlSeconds: 60 * 60 * 24 * 14 },
+    )
+
+    return c.text('forbidden', 403)
+  }
+
+  const exec = (c as any).executionCtx
+
+  // Debug breadcrumb (sync): proves the webhook was accepted and KV is writable
+  await kvPutJson(
+    (c.env as any).NEUROVALYUSHA_KV,
+    'nv:vk:lastCallback',
+    {
+      ts: Date.now(),
+      type: payload?.type,
+      event_id: payload?.event_id,
+      group_id: payload?.group_id,
+      hasWaitUntil: Boolean(exec?.waitUntil),
+    },
+    { ttlSeconds: 60 * 60 * 24 * 14 },
+  )
+
+  // IMPORTANT: In some Pages runtimes, "fire-and-forget" promises may be cancelled after returning the response.
+  // Prefer waitUntil when available; otherwise await to ensure the event is actually processed.
+  if (exec?.waitUntil) exec.waitUntil(processVkCallbackEvent(c.env, payload))
+  else await processVkCallbackEvent(c.env, payload)
+
+  return c.text('ok')
+})
+
+// Telegram Bot API webhook
+app.post('/api/tg/webhook', async (c) => {
+  const secret = c.req.header('x-telegram-bot-api-secret-token')
+  if (!isValidTelegramRequest(c.env, secret)) return c.text('forbidden', 403)
+
+  const update = (await c.req.json().catch(() => null)) as any
+  if (!update) return c.text('bad request', 400)
+
+  const exec = (c as any).executionCtx
+
+  await kvPutJson(
+    (c.env as any).NEUROVALYUSHA_KV,
+    'nv:tg:lastWebhook',
+    {
+      ts: Date.now(),
+      update_id: update?.update_id,
+      hasWaitUntil: Boolean(exec?.waitUntil),
+    },
+    { ttlSeconds: 60 * 60 * 24 * 14 },
+  )
+
+  // Same rationale as VK: do not rely on fire-and-forget without waitUntil.
+  if (exec?.waitUntil) exec.waitUntil(processTelegramUpdate(c.env, update))
+  else await processTelegramUpdate(c.env, update)
+
+  return c.text('ok')
+})
+
+// Ensure we always return a Response (prevents Cloudflare 1101 on unknown paths)
+app.notFound((c) => {
+  // Keep API behavior predictable
+  if (c.req.path.startsWith('/api/')) return c.json({ error: 'Not Found' }, 404)
+  return c.text('Not Found', 404)
+})
+
+app.onError((err, c) => {
+  console.error('Unhandled error:', err)
+  if (c.req.path.startsWith('/api/')) return c.json({ error: 'Internal Server Error' }, 500)
+  return c.text('Internal Server Error', 500)
+})
 
 async function handleBotChat(
   c: any,
