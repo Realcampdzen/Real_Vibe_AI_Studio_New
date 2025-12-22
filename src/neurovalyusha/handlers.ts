@@ -19,7 +19,13 @@ export type NeuroValyushaBindings = {
   // Telegram
   TELEGRAM_BOT_TOKEN?: string
   TELEGRAM_WEBHOOK_SECRET?: string
+  // Optional: limit bot to a specific discussion group (chat id, usually -100...)
+  TELEGRAM_DISCUSSION_GROUP_ID?: string
+  // Backward-compatible alias (some older envs use this name)
+  DISCUSSION_GROUP_ID?: string
   TELEGRAM_CHANNEL_ID?: string
+  // Optional: limit bot to a specific channel by username (e.g. "@realcampspb")
+  TELEGRAM_CHANNEL_ID_USERNAME?: string
 }
 
 type VkCallbackPayload = {
@@ -578,6 +584,13 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
   const chatId = Number(msg.chat?.id)
   if (!Number.isFinite(chatId)) return
 
+  // Optional: hard-limit to a specific discussion group (prevents reacting in DMs/other chats)
+  const allowedGroupIdRaw = env.TELEGRAM_DISCUSSION_GROUP_ID || env.DISCUSSION_GROUP_ID
+  if (isNonEmptyString(allowedGroupIdRaw)) {
+    const allowedGroupId = Number(allowedGroupIdRaw)
+    if (Number.isFinite(allowedGroupId) && allowedGroupId !== chatId) return
+  }
+
   const text = (msg.text || msg.caption || '').trim()
 
   // New channel post forwarded into discussion group
@@ -585,6 +598,12 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
     // Optional: limit to a specific channel
     if (isNonEmptyString(env.TELEGRAM_CHANNEL_ID) && Number(env.TELEGRAM_CHANNEL_ID) !== msg.forward_from_chat.id) {
       return
+    }
+    // Optional: limit to a specific channel by username (handy when you only have @name)
+    if (isNonEmptyString(env.TELEGRAM_CHANNEL_ID_USERNAME)) {
+      const expected = env.TELEGRAM_CHANNEL_ID_USERNAME.trim().replace(/^@/, '').toLowerCase()
+      const actual = (msg.forward_from_chat.username || '').trim().replace(/^@/, '').toLowerCase()
+      if (!expected || !actual || expected !== actual) return
     }
 
     const rootId = msg.message_id

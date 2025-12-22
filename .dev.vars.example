@@ -13,6 +13,13 @@ VK_ACCESS_TOKEN=your_vk_community_access_token
 # Telegram
 TELEGRAM_BOT_TOKEN=123456:ABCDEF_your_bot_token
 TELEGRAM_WEBHOOK_SECRET=your_webhook_secret_token
+# Опционально: ограничить ответы только для конкретного канала (по id или по @username)
 # TELEGRAM_CHANNEL_ID=-1001234567890
+# TELEGRAM_CHANNEL_ID_USERNAME=@realcampspb
+
+# Опционально: ограничить ответы только в конкретной группе-обсуждении (chat_id, обычно -100...)
+# TELEGRAM_DISCUSSION_GROUP_ID=-1002516417808
+# (алиас для старых env)
+# DISCUSSION_GROUP_ID=-1002516417808
 
 

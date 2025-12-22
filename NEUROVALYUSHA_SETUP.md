@@ -22,7 +22,10 @@
 ### Telegram
 - `TELEGRAM_BOT_TOKEN` — токен бота
 - `TELEGRAM_WEBHOOK_SECRET` — секрет для заголовка `X-Telegram-Bot-Api-Secret-Token`
-- `TELEGRAM_CHANNEL_ID` — опционально: ограничить ответы только на автоматические форварды из конкретного канала
+- `TELEGRAM_CHANNEL_ID` — опционально: ограничить ответы только на автоматические форварды из конкретного канала (числовой id канала)
+- `TELEGRAM_CHANNEL_ID_USERNAME` — опционально: ограничить ответы по @username канала (например `@realcampspb`)
+- `TELEGRAM_DISCUSSION_GROUP_ID` — опционально: ограничить работу бота только одной группой‑обсуждением (chat id группы, обычно `-100...`)
+- `DISCUSSION_GROUP_ID` — алиас для `TELEGRAM_DISCUSSION_GROUP_ID` (если у вас уже так названо в env)
 
 ## KV (память 10 сообщений + дедупликация)
 
@@ -96,5 +99,23 @@ Cloudflare Pages → проект → **Settings → Variables and Secrets** (Pr
 3) Поставить webhook на `POST /api/tg/webhook` с secret token.
 
 Примечание: бот реагирует на “новый пост” когда видит **автоматический форвард** поста канала в группе (поле `is_automatic_forward`).
+
+### Рекомендованная конфигурация (production)
+
+- **Ограничить чат** (чтобы бот не отвечал в личке/других группах):
+  - задайте `TELEGRAM_DISCUSSION_GROUP_ID` (или `DISCUSSION_GROUP_ID`) = chat id вашей группы‑обсуждения (например `-1002516417808`)
+- **Ограничить канал** (чтобы реагировать только на ваш канал):
+  - задайте `TELEGRAM_CHANNEL_ID` (числовой id канала, обычно `-100...`) **или** `TELEGRAM_CHANNEL_ID_USERNAME=@вашканал`
+
+### Установка webhook
+
+Нужно один раз вызвать `setWebhook` и передать `secret_token`, который совпадает с `TELEGRAM_WEBHOOK_SECRET` в Cloudflare.
+Пример (подставьте домен Pages, токен бота и secret):
+
+```bash
+curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d "{\"url\":\"https://<your-pages-domain>/api/tg/webhook\",\"secret_token\":\"<TELEGRAM_WEBHOOK_SECRET>\",\"allowed_updates\":[\"message\",\"edited_message\"]}"
+```
 
 
