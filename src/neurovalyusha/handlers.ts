@@ -649,6 +649,7 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
       chatId,
       text: comment,
       replyToMessageId: rootId,
+      kv,
     })
 
     if (sent?.message_id) {
@@ -713,6 +714,7 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
       chatId,
       text: reply,
       replyToMessageId: msg.message_id,
+      kv,
     })
 
     if (sent?.message_id) {
@@ -743,8 +745,9 @@ async function tgSendMessage(params: {
   chatId: number
   text: string
   replyToMessageId?: number
+  kv?: KVNamespace
 }): Promise<{ message_id: number } | null> {
-  const { botToken, chatId, text, replyToMessageId } = params
+  const { botToken, chatId, text, replyToMessageId, kv } = params
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`
 
   const body: any = {
@@ -766,6 +769,26 @@ async function tgSendMessage(params: {
   const data = (await res.json().catch(() => null)) as any
   const mid = Number(data?.result?.message_id)
   if (Number.isFinite(mid) && mid > 0) return { message_id: mid }
+
+  // Store last send error for quick debugging (no secrets)
+  if (kv) {
+    await kvPutJson(
+      kv,
+      'nv:tg:lastSendError',
+      {
+        ts: nowTs(),
+        chatId,
+        replyToMessageId: typeof replyToMessageId === 'number' ? replyToMessageId : undefined,
+        httpStatus: res.status,
+        error_code: data?.error_code,
+        description: data?.description,
+        // Avoid storing full generated text; keep only a tiny preview
+        textPreview: typeof text === 'string' ? text.slice(0, 160) : undefined,
+        raw: typeof data === 'object' && data ? JSON.stringify(data).slice(0, 2000) : undefined,
+      },
+      { ttlSeconds: 60 * 60 * 24 * 14 },
+    )
+  }
   return null
 }
 
