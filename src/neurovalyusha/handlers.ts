@@ -1,5 +1,5 @@
 import type { Fetcher, KVNamespace } from '@cloudflare/workers-types'
-import { NEUROVALYUSHA_MODEL, NEUROVALYUSHA_SOCIAL_BASE_SYSTEM, NEUROVALYUSHA_SOCIAL_SYSTEM } from './constants'
+import { NEUROVALYUSHA_MODEL, NEUROVALYUSHA_SOCIAL_SYSTEM } from './constants'
 import { callOpenAIChat, type OpenAIChatMessage } from './openai'
 import { kvGetJson, kvGetText, kvIsDuplicate, kvPutJson, kvPutText } from './kv'
 import { appendConversationMemory, getConversationMemory, truncate, type MemoryMessage } from './memory'
@@ -7,6 +7,8 @@ import { loadBadgeIndex, scoreBadges, type BadgeIndexEntry } from './guidebook_i
 
 export type NeuroValyushaBindings = {
   OPENAI_API_KEY?: string
+  OPENAI_PROXY_BASE_URL?: string
+  OPENAI_PROXY_TOKEN?: string
   NEUROVALYUSHA_KV?: KVNamespace
   ASSETS?: Fetcher
 
@@ -182,13 +184,13 @@ async function selectBadgeCandidate(params: {
 function buildMessagesForNewPost(platform: 'vk' | 'tg', postText: string): OpenAIChatMessage[] {
   const clipped = truncate(postText.trim(), 1800)
   return [
-    { role: 'system', content: NEUROVALYUSHA_SOCIAL_BASE_SYSTEM },
+    { role: 'system', content: NEUROVALYUSHA_SOCIAL_SYSTEM },
     {
       role: 'system',
       content:
         platform === 'vk'
-          ? 'СЕЙЧАС: напиши один комментарий к новому посту ВК (2–4 коротких абзаца, 400–900 знаков, 0–3 эмодзи, без markdown). НЕ задавай вопросов и не используй знак "?". CTA будет добавлен отдельно.'
-          : 'СЕЙЧАС: напиши один комментарий к новому посту в Telegram (2–4 коротких абзаца, 400–900 знаков, 0–3 эмодзи, без markdown). НЕ задавай вопросов и не используй знак "?". CTA будет добавлен отдельно.',
+          ? 'СЕЙЧАС: напиши один комментарий к новому посту ВК (2–4 коротких абзаца, 400–900 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.'
+          : 'СЕЙЧАС: напиши один комментарий к новому посту в Telegram (2–4 коротких абзаца, 400–900 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.',
     },
     { role: 'user', content: `Текст поста:\n${clipped}` },
   ]
@@ -199,13 +201,13 @@ function buildMessagesForReply(
   memory: MemoryMessage[],
 ): OpenAIChatMessage[] {
   return [
-    { role: 'system', content: NEUROVALYUSHA_SOCIAL_BASE_SYSTEM },
+    { role: 'system', content: NEUROVALYUSHA_SOCIAL_SYSTEM },
     {
       role: 'system',
       content:
         platform === 'vk'
-          ? 'СЕЙЧАС: ответь как комментарий ВК, учитывая контекст переписки выше. 2–4 коротких абзаца, 200–900 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова. НЕ задавай вопросов и не используй знак "?". CTA будет добавлен отдельно.'
-          : 'СЕЙЧАС: ответь как комментарий в Telegram, учитывая контекст переписки выше. 2–4 коротких абзаца, 200–900 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова. НЕ задавай вопросов и не используй знак "?". CTA будет добавлен отдельно.',
+          ? 'СЕЙЧАС: ответь как комментарий ВК, учитывая контекст переписки выше. 2–4 коротких абзаца, 200–900 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.'
+          : 'СЕЙЧАС: ответь как комментарий в Telegram, учитывая контекст переписки выше. 2–4 коротких абзаца, 200–900 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.',
     },
     ...memory.map((m) => ({ role: m.role, content: m.content })),
   ]
@@ -214,181 +216,27 @@ function buildMessagesForReply(
 async function generateValyushaText(
   env: NeuroValyushaBindings,
   messages: OpenAIChatMessage[],
-  opts?: { temperature?: number; maxTokens?: number },
+  opts?: { temperature?: number; maxTokens?: number; platform?: 'vk' | 'tg' },
 ): Promise<string> {
   const apiKey = env.OPENAI_API_KEY
   if (!apiKey) {
     return 'Спасибо за тему! 💜 Давайте развернём её в сторону 4K‑навыков: что здесь про критическое мышление/креатив/команду?'
   }
+  // VK: не используем proxy (как в коммите a8ccff7, когда бот заработал)
+  // Telegram: может использовать proxy если настроен
+  const useProxy = opts?.platform !== 'vk'
+  const proxyBaseUrl = useProxy && isNonEmptyString(env.OPENAI_PROXY_BASE_URL) ? env.OPENAI_PROXY_BASE_URL : undefined
+  const proxyToken = useProxy && isNonEmptyString(env.OPENAI_PROXY_TOKEN) ? env.OPENAI_PROXY_TOKEN : undefined
   const raw = await callOpenAIChat({
     apiKey,
     model: NEUROVALYUSHA_MODEL,
     messages,
     temperature: typeof opts?.temperature === 'number' ? opts.temperature : 0.75,
     maxTokens: typeof opts?.maxTokens === 'number' ? opts.maxTokens : 450,
+    baseUrl: proxyBaseUrl,
+    proxyToken,
   })
   return raw || 'Классная мысль! 💜 А как вы думаете, какая 4K‑навык тут прокачивается сильнее всего?'
-}
-
-type CtaMode = 'CTA-1' | 'CTA-2'
-
-const CTA_BANNED_PHRASES = [
-  'делитесь',
-  'в комментариях',
-  'подписывайтесь',
-  'ставьте лайк',
-  'ставь лайк',
-  'ставьте лайки',
-  'лайк',
-  'лайки',
-]
-
-function stripQuestionMarks(text: string): string {
-  return (text || '').replace(/[?？]+/g, '.')
-}
-
-function detectPostHasCta(postText: string): boolean {
-  const t = (postText || '').toLowerCase()
-  if (/[?？]/.test(t)) return true
-  const signals = [
-    'что думаете',
-    'как думаете',
-    'как считаете',
-    'ваше мнение',
-    'поделитесь',
-    'пишите',
-    'ответьте',
-    'опрос',
-    'проголос',
-    'выберите',
-  ]
-  return signals.some((s) => t.includes(s))
-}
-
-function extractPostTextFromMemory(memory: MemoryMessage[]): string | null {
-  for (const m of memory) {
-    if (m.role !== 'user') continue
-    const c = m.content || ''
-    if (c.startsWith('Пост (ВК):')) return c.replace(/^Пост \(ВК\):\s*/, '').trim()
-    if (c.startsWith('Пост (Telegram):')) return c.replace(/^Пост \(Telegram\):\s*/, '').trim()
-  }
-  return null
-}
-
-function extractLastParticipantText(memory: MemoryMessage[]): string {
-  for (let i = memory.length - 1; i >= 0; i -= 1) {
-    const m = memory[i]
-    if (m.role !== 'user') continue
-    const c = (m.content || '').trim()
-    if (!c) continue
-    if (c.startsWith('Пост (ВК):') || c.startsWith('Пост (Telegram):')) continue
-    return c
-  }
-  return ''
-}
-
-function normalizeCtaCandidate(raw: string): string {
-  const cleaned = normalizeOutgoingText(raw || '', 220)
-    .replace(/\s+/g, ' ')
-    .replace(/\s+\?/g, '?')
-    .trim()
-
-  // Keep only one "?"
-  const firstQ = cleaned.indexOf('?')
-  if (firstQ === -1) return cleaned
-  const before = cleaned.slice(0, firstQ + 1)
-  return before.replace(/[?？]/g, '?')
-}
-
-function isValidCta(cta: string): boolean {
-  const t = (cta || '').trim()
-  if (!t) return false
-  if (t.includes('\n')) return false
-  const qCount = (t.match(/\?/g) || []).length
-  if (qCount !== 1) return false
-  if (!t.endsWith('?')) return false
-  if (t.length < 35 || t.length > 120) return false
-  const lower = t.toLowerCase()
-  if (CTA_BANNED_PHRASES.some((p) => lower.includes(p))) return false
-  return true
-}
-
-function fallbackCta(postText: string, mode: CtaMode): string {
-  const base = mode === 'CTA-2' ? 'Если выбирать одно' : 'Если одной фразой'
-  // Pick a simple “anchor” token from the post
-  const words = (postText || '')
-    .replace(/https?:\/\/\S+/g, '')
-    .replace(/[^\p{L}\p{N}\s-]+/gu, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length >= 5)
-  const anchor = words[0] ? words[0].slice(0, 18) : 'это'
-  const t = `${base}: про «${anchor}» — что ближе?`
-  const clipped = truncate(t, 120)
-  return clipped.endsWith('?') ? clipped : `${truncate(clipped, 119)}?`
-}
-
-async function generateCtaQuestion(params: {
-  env: NeuroValyushaBindings
-  platform: 'vk' | 'tg'
-  postText: string
-  contextText?: string
-}): Promise<string> {
-  const { env, platform, postText, contextText } = params
-  const apiKey = env.OPENAI_API_KEY
-  const mode: CtaMode = detectPostHasCta(postText) ? 'CTA-2' : 'CTA-1'
-
-  if (!apiKey) return fallbackCta(postText, mode)
-
-  const clippedPost = truncate((postText || '').trim(), 1800)
-  const clippedCtx = truncate((contextText || '').trim(), 800)
-
-  const baseMessages: OpenAIChatMessage[] = [
-    { role: 'system', content: NEUROVALYUSHA_SOCIAL_SYSTEM },
-    {
-      role: 'system',
-      content:
-        (platform === 'vk'
-          ? 'СЕЙЧАС: сгенерируй ТОЛЬКО CTA-вопрос для ВК (одно предложение).'
-          : 'СЕЙЧАС: сгенерируй ТОЛЬКО CTA-вопрос для Telegram (одно предложение).') +
-        ' Без markdown. Без списков. Без кавычек вокруг всего ответа. Ровно 1 знак вопроса "?" и он в конце. 35–120 символов. ' +
-        `Режим: ${mode}. В CTA используй 1 якорь из текста поста. ` +
-        'Запрещено: “делитесь”, “в комментариях”, “подписывайтесь”, “ставьте лайк”. ' +
-        'Запрещено упоминать значки Путеводителя/ID/слово “значок” в CTA.',
-    },
-    { role: 'user', content: `Текст поста:\n${clippedPost}` },
-  ]
-
-  const messages =
-    clippedCtx.length > 0
-      ? [...baseMessages, { role: 'user' as const, content: `Контекст ветки/реплики (если поможет с якорем):\n${clippedCtx}` }]
-      : baseMessages
-
-  // Try twice: first normal, then more deterministic
-  for (const attempt of [0, 1] as const) {
-    const raw = await generateValyushaText(env, messages, {
-      temperature: attempt === 0 ? 0.6 : 0.3,
-      maxTokens: 120,
-    })
-    const cta = normalizeCtaCandidate(raw)
-    if (isValidCta(cta)) return cta
-  }
-
-  return fallbackCta(postText, mode)
-}
-
-async function generateSocialTextWithCta(params: {
-  env: NeuroValyushaBindings
-  platform: 'vk' | 'tg'
-  postTextForCta: string
-  bodyMessages: OpenAIChatMessage[]
-  maxChars: number
-  ctaContextText?: string
-}): Promise<string> {
-  const { env, platform, postTextForCta, bodyMessages, maxChars, ctaContextText } = params
-  const bodyRaw = await generateValyushaText(env, bodyMessages, { temperature: 0.75, maxTokens: 450 })
-  const body = stripQuestionMarks(normalizeOutgoingText(bodyRaw, Math.max(200, maxChars - 180))).trim()
-  const cta = await generateCtaQuestion({ env, platform, postText: postTextForCta, contextText: ctaContextText })
-  return normalizeOutgoingText([body, cta].filter(Boolean).join('\n\n'), maxChars)
 }
 
 // ---------------- VK ----------------
@@ -508,13 +356,8 @@ export async function processVkCallbackEvent(env: NeuroValyushaBindings, payload
             },
           ]),
     ]
-    const comment = await generateSocialTextWithCta({
-      env,
-      platform: 'vk',
-      postTextForCta: postText || '',
-      bodyMessages: aiMessages,
-      maxChars: 1200,
-    })
+    // VK: используем старую версию без опций (как в a8ccff7, когда бот заработал)
+    const comment = normalizeOutgoingText(await generateValyushaText(env, aiMessages, { platform: 'vk' }), 1200)
     const vkComment = withVkPrefix(comment)
 
     const commentId = await vkCreateComment({
@@ -622,15 +465,8 @@ export async function processVkCallbackEvent(env: NeuroValyushaBindings, payload
             },
           ]),
     ]
-    const postTextForCta = extractPostTextFromMemory(memory) || ''
-    const reply = await generateSocialTextWithCta({
-      env,
-      platform: 'vk',
-      postTextForCta: postTextForCta || text || '',
-      bodyMessages: aiMessages,
-      maxChars: 1200,
-      ctaContextText: text || extractLastParticipantText(memory),
-    })
+    // VK: используем старую версию без опций (как в a8ccff7, когда бот заработал)
+    const reply = normalizeOutgoingText(await generateValyushaText(env, aiMessages, { platform: 'vk' }), 1200)
     const vkReply = withVkPrefix(reply)
 
     const newCommentId = await vkCreateComment({
@@ -821,13 +657,8 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
             },
           ]),
     ]
-    const comment = await generateSocialTextWithCta({
-      env,
-      platform: 'tg',
-      postTextForCta: text || '',
-      bodyMessages: aiMessages,
-      maxChars: 1200,
-    })
+    const commentRaw = await generateValyushaText(env, aiMessages, { temperature: 0.75, maxTokens: 450, platform: 'tg' })
+    const comment = normalizeOutgoingText(commentRaw, 1200)
 
     const sent = await tgSendMessage({
       botToken: env.TELEGRAM_BOT_TOKEN,
@@ -892,15 +723,8 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
             },
           ]),
     ]
-    const postTextForCta = extractPostTextFromMemory(memory) || ''
-    const reply = await generateSocialTextWithCta({
-      env,
-      platform: 'tg',
-      postTextForCta: postTextForCta || text || '',
-      bodyMessages: aiMessages,
-      maxChars: 1200,
-      ctaContextText: text || extractLastParticipantText(memory),
-    })
+    const replyRaw = await generateValyushaText(env, aiMessages, { temperature: 0.75, maxTokens: 450, platform: 'tg' })
+    const reply = normalizeOutgoingText(replyRaw, 1200)
 
     const sent = await tgSendMessage({
       botToken: env.TELEGRAM_BOT_TOKEN,
