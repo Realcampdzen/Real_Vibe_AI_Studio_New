@@ -1,6 +1,6 @@
 export type OpenAIChatMessage = {
   role: 'system' | 'user' | 'assistant'
-  content: string
+  content: string | Array<{ type: 'text' | 'image_url'; text?: string; image_url?: { url: string } }>
 }
 
 type OpenAIChatCompletionResponse = {
@@ -13,15 +13,24 @@ export async function callOpenAIChat(params: {
   messages: OpenAIChatMessage[]
   temperature?: number
   maxTokens?: number
+  baseUrl?: string
+  proxyToken?: string
 }): Promise<string> {
-  const { apiKey, model, messages, temperature = 0.7, maxTokens = 700 } = params
+  const { apiKey, model, messages, temperature = 0.7, maxTokens = 700, baseUrl, proxyToken } = params
+  const normalizedBaseUrl =
+    typeof baseUrl === 'string' && baseUrl.trim().length > 0 ? baseUrl.trim().replace(/\/+$/, '') : 'https://api.openai.com'
 
-  const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+  }
+  if (typeof proxyToken === 'string' && proxyToken.trim().length > 0) {
+    headers['X-Proxy-Token'] = proxyToken.trim()
+  }
+
+  const openaiResponse = await fetch(`${normalizedBaseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers,
     body: JSON.stringify({
       model,
       messages,

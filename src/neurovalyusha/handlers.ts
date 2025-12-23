@@ -1,5 +1,5 @@
 import type { Fetcher, KVNamespace } from '@cloudflare/workers-types'
-import { NEUROVALYUSHA_MODEL, NEUROVALYUSHA_SOCIAL_SYSTEM } from './constants'
+import { FORBIDDEN_EMOJIS, NEUROVALYUSHA_MODEL, NEUROVALYUSHA_SOCIAL_SYSTEM } from './constants'
 import { callOpenAIChat, type OpenAIChatMessage } from './openai'
 import { kvGetJson, kvGetText, kvIsDuplicate, kvPutJson, kvPutText } from './kv'
 import { appendConversationMemory, getConversationMemory, truncate, type MemoryMessage } from './memory'
@@ -52,6 +52,7 @@ type TgMessage = {
   from?: { id: number; is_bot?: boolean; first_name?: string; username?: string }
   text?: string
   caption?: string
+  photo?: Array<{ file_id: string; file_unique_id: string; width: number; height: number; file_size?: number }>
   is_automatic_forward?: boolean
   forward_from_chat?: { id: number; type?: string; title?: string; username?: string }
   forward_from_message_id?: number
@@ -68,12 +69,18 @@ function isNonEmptyString(v: unknown): v is string {
 
 function normalizeOutgoingText(text: string, maxChars: number): string {
   // No markdown formatting; keep it short.
-  const cleaned = text
+  let cleaned = text
     .replace(/\r\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .replace(/\*\*/g, '')
     .replace(/__/g, '')
     .trim()
+  
+  // Удаляем запрещённые эмодзи
+  for (const emoji of FORBIDDEN_EMOJIS) {
+    cleaned = cleaned.replace(new RegExp(emoji.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '')
+  }
+  
   return truncate(cleaned, maxChars)
 }
 
@@ -189,8 +196,8 @@ function buildMessagesForNewPost(platform: 'vk' | 'tg', postText: string): OpenA
       role: 'system',
       content:
         platform === 'vk'
-          ? 'СЕЙЧАС: напиши один комментарий к новому посту ВК (2–4 коротких абзаца, 400–900 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.'
-          : 'СЕЙЧАС: напиши один комментарий к новому посту в Telegram (2–4 коротких абзаца, 400–900 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.',
+          ? 'СЕЙЧАС: напиши один комментарий к новому посту ВК (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.'
+          : 'СЕЙЧАС: напиши один комментарий к новому посту в Telegram (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.',
     },
     { role: 'user', content: `Текст поста:\n${clipped}` },
   ]
@@ -206,8 +213,8 @@ function buildMessagesForReply(
       role: 'system',
       content:
         platform === 'vk'
-          ? 'СЕЙЧАС: ответь как комментарий ВК, учитывая контекст переписки выше. 2–4 коротких абзаца, 200–900 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.'
-          : 'СЕЙЧАС: ответь как комментарий в Telegram, учитывая контекст переписки выше. 2–4 коротких абзаца, 200–900 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.',
+          ? 'СЕЙЧАС: ответь как комментарий ВК, учитывая контекст переписки выше. 1–3 коротких абзаца, 150–700 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.'
+          : 'СЕЙЧАС: ответь как комментарий в Telegram, учитывая контекст переписки выше. 1–3 коротких абзаца, 150–700 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.',
     },
     ...memory.map((m) => ({ role: m.role, content: m.content })),
   ]
@@ -227,16 +234,21 @@ async function generateValyushaText(
   const useProxy = opts?.platform !== 'vk'
   const proxyBaseUrl = useProxy && isNonEmptyString(env.OPENAI_PROXY_BASE_URL) ? env.OPENAI_PROXY_BASE_URL : undefined
   const proxyToken = useProxy && isNonEmptyString(env.OPENAI_PROXY_TOKEN) ? env.OPENAI_PROXY_TOKEN : undefined
-  const raw = await callOpenAIChat({
-    apiKey,
-    model: NEUROVALYUSHA_MODEL,
-    messages,
-    temperature: typeof opts?.temperature === 'number' ? opts.temperature : 0.75,
-    maxTokens: typeof opts?.maxTokens === 'number' ? opts.maxTokens : 450,
-    baseUrl: proxyBaseUrl,
-    proxyToken,
-  })
-  return raw || 'Классная мысль! 💜 А как вы думаете, какая 4K‑навык тут прокачивается сильнее всего?'
+  try {
+    const raw = await callOpenAIChat({
+      apiKey,
+      model: NEUROVALYUSHA_MODEL,
+      messages,
+      temperature: typeof opts?.temperature === 'number' ? opts.temperature : 0.75,
+      maxTokens: typeof opts?.maxTokens === 'number' ? opts.maxTokens : 450,
+      baseUrl: proxyBaseUrl,
+      proxyToken,
+    })
+    return raw || 'Классная мысль! 💜 А как вы думаете, какая 4K‑навык тут прокачивается сильнее всего?'
+  } catch (error) {
+    // Обработка ошибок OpenAI API: возвращаем fallback ответ
+    return 'Классная мысль! 💜 А как вы думаете, какая 4K‑навык тут прокачивается сильнее всего?'
+  }
 }
 
 // ---------------- VK ----------------
@@ -575,6 +587,19 @@ async function vkCreateComment(params: {
   return null
 }
 
+async function getTelegramFileUrl(botToken: string, fileId: string): Promise<string | null> {
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`
+    const res = await fetch(url)
+    if (!res.ok) return null
+    const data = (await res.json().catch(() => null)) as any
+    if (!data?.ok || !data?.result?.file_path) return null
+    return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`
+  } catch {
+    return null
+  }
+}
+
 // ---------------- Telegram ----------------
 
 export function isValidTelegramRequest(env: NeuroValyushaBindings, secretHeader: string | undefined): boolean {
@@ -626,11 +651,27 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
     const already = await kvGetText(kv, postKey)
     if (already) return
 
+    // Получаем фото, если есть (берем самое большое)
+    let imageUrl: string | null = null
+    if (Array.isArray(msg.photo) && msg.photo.length > 0 && env.TELEGRAM_BOT_TOKEN) {
+      try {
+        // Берем последний элемент (самое большое фото)
+        const largestPhoto = msg.photo[msg.photo.length - 1]
+        imageUrl = await getTelegramFileUrl(env.TELEGRAM_BOT_TOKEN, largestPhoto.file_id)
+      } catch {
+        // Игнорируем ошибки получения URL изображения
+        imageUrl = null
+      }
+    }
+
+    // Если нет ни текста, ни изображения - пропускаем
+    if (!text && !imageUrl) return
+
     const conversationKey = `nv:tg:conv:${chatId}:${rootId}`
 
     await appendConversationMemory(kv, conversationKey, {
       role: 'user',
-      content: `Пост (Telegram): ${truncate(text || '(без текста)', 1800)}`,
+      content: `Пост (Telegram): ${truncate(text || '(пост с изображением)', 1800)}`,
       ts: nowTs(),
     })
 
@@ -641,8 +682,29 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
       searchText: text || '',
     })
 
-    const aiMessages = [
-      ...buildMessagesForNewPost('tg', text || ''),
+    // Формируем контент для LLM: текст + изображение (если есть)
+    const userContent: Array<{ type: 'text' | 'image_url'; text?: string; image_url?: { url: string } }> = []
+    
+    if (text) {
+      userContent.push({ type: 'text', text: `Текст поста:\n${truncate(text, 1800)}` })
+    }
+    
+    if (imageUrl) {
+      userContent.push({ type: 'image_url', image_url: { url: imageUrl } })
+      if (!text) {
+        // Если только фото без текста, добавляем инструкцию
+        userContent.unshift({ type: 'text', text: 'Это пост с изображением без текста. Проанализируй изображение и напиши полезный комментарий, связанный с темами лагеря (4K навыки, софт-скиллы, ИИ для обучения и творчества).' })
+      }
+    }
+
+    const aiMessages: OpenAIChatMessage[] = [
+      { role: 'system', content: NEUROVALYUSHA_SOCIAL_SYSTEM },
+      {
+        role: 'system',
+        content: imageUrl
+          ? 'СЕЙЧАС: напиши один комментарий к посту в Telegram с изображением (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). Проанализируй изображение и свяжи его с темами лагеря (4K навыки, софт-скиллы, ИИ для обучения и творчества). В конце можно 1 вопрос.'
+          : 'СЕЙЧАС: напиши один комментарий к новому посту в Telegram (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.',
+      },
       ...(selectedBadge
         ? [
             {
@@ -656,7 +718,9 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
               content: 'Для этого комментария значок не подходит — НЕ упоминай значки Путеводителя.',
             },
           ]),
+      { role: 'user', content: userContent },
     ]
+    
     const commentRaw = await generateValyushaText(env, aiMessages, { temperature: 0.75, maxTokens: 450, platform: 'tg' })
     const comment = normalizeOutgoingText(commentRaw, 1200)
 
