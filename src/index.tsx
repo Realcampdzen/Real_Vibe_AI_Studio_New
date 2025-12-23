@@ -366,7 +366,9 @@ app.post('/api/vk/callback', async (c) => {
       { ttlSeconds: 60 * 60 * 24 * 14 },
     )
 
-    return c.text('forbidden', 403)
+    // VK can disable callback servers if it receives non-"ok" responses for events.
+    // We keep the server stable by returning "ok" and just skipping processing when validation fails.
+    return c.text('ok')
   }
 
   const exec = (c as any).executionCtx
@@ -391,6 +393,59 @@ app.post('/api/vk/callback', async (c) => {
   else await processVkCallbackEvent(c.env, payload)
 
   return c.text('ok')
+})
+
+// NeuroValyusha debug endpoint (no secrets) — avoids digging in KV dashboard
+app.get('/api/debug/nv', async (c) => {
+  const kv = (c.env as any).NEUROVALYUSHA_KV
+
+  const safeGet = async (key: string) => {
+    try {
+      const raw = await kv?.get(key)
+      if (!raw) return null
+      return JSON.parse(raw)
+    } catch {
+      return null
+    }
+  }
+
+  const pruneVkCreateError = (e: any) => {
+    if (!e || typeof e !== 'object') return e
+    return {
+      ts: e.ts,
+      ownerId: e.ownerId,
+      postId: e.postId,
+      httpStatus: e.httpStatus,
+      error_code: e.error_code,
+      error_msg: e.error_msg,
+    }
+  }
+
+  return c.json({
+    ok: true,
+    env: {
+      hasOpenAIKey: Boolean(c.env.OPENAI_API_KEY),
+      hasKV: Boolean(kv),
+      hasVkGroupId: Boolean(c.env.VK_GROUP_ID),
+      hasVkSecret: Boolean(c.env.VK_SECRET),
+      hasVkConfirmationCode: Boolean(c.env.VK_CONFIRMATION_CODE),
+      hasVkAccessToken: Boolean(c.env.VK_ACCESS_TOKEN),
+      hasTgBotToken: Boolean(c.env.TELEGRAM_BOT_TOKEN),
+      hasTgSecret: Boolean(c.env.TELEGRAM_WEBHOOK_SECRET),
+    },
+    vk: {
+      lastCallback: await safeGet('nv:vk:lastCallback'),
+      lastEvent: await safeGet('nv:vk:lastEvent'),
+      lastWallPostNew: await safeGet('nv:vk:lastWallPostNew'),
+      lastWallReplyNew: await safeGet('nv:vk:lastWallReplyNew'),
+      lastForbidden: await safeGet('nv:vk:lastForbidden'),
+      lastCreateCommentError: pruneVkCreateError(await safeGet('nv:vk:lastCreateCommentError')),
+    },
+    tg: {
+      lastWebhook: await safeGet('nv:tg:lastWebhook'),
+      lastSendError: await safeGet('nv:tg:lastSendError'),
+    },
+  })
 })
 
 // Telegram Bot API webhook
