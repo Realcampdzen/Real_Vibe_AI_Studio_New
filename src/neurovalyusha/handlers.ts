@@ -84,10 +84,24 @@ function normalizeOutgoingText(text: string, maxChars: number): string {
 
   // Запрещённая конструкция “не только …, но и …” → заменяем на прямое перечисление (без дополнительного вызова LLM)
   // Пример: "не только про X, но и про Y" -> "и про X, и про Y"
-  cleaned = cleaned.replace(/\bне\s+только\b([^\n]{0,220}?)\bно\s+и\b/gi, (_m, mid: string) => {
-    const safeMid = typeof mid === 'string' ? mid.replace(/\s*$/, ' ') : ' '
-    return `и${safeMid}и`
-  })
+  // Важно: \b (word boundary) в JS не работает для кириллицы, поэтому не используем его.
+  cleaned = cleaned.replace(
+    /не\s+только\s+([^\n]{1,220}?)\s*[,–—-]?\s*но\s+и\s+([^\n]{1,220}?)(?=\s*(?:[,.!?:;]|\n|$))/giu,
+    (_m, left: string, right: string) => {
+      const l = String(left || '')
+        .trim()
+        .replace(/^[\s,–—-]+/, '')
+        .replace(/[\s,–—-]+$/, '')
+      const r = String(right || '')
+        .trim()
+        .replace(/^[\s,–—-]+/, '')
+        .replace(/[\s,–—-]+$/, '')
+      if (!l && !r) return ''
+      if (!l) return `и ${r}`
+      if (!r) return `и ${l}`
+      return `и ${l}, и ${r}`
+    },
+  )
   
   return truncate(cleaned, maxChars)
 }
@@ -838,14 +852,15 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
     const postIdentity = computeTelegramPostIdentity(msg)
     const postKey = `nv:tg:post:${chatId}:${postIdentity}:commented`
 
-    const isMediaGroup = isNonEmptyString(msg.media_group_id)
+    const mediaGroupId = isNonEmptyString(msg.media_group_id) ? msg.media_group_id : null
+    const isMediaGroup = mediaGroupId !== null
 
     // For albums: unify all items into a single root so replies map to one thread
     const rootId = isMediaGroup
       ? await getOrUpdateTelegramMediaGroupRootId({
           kv,
           chatId,
-          mediaGroupId: msg.media_group_id,
+          mediaGroupId,
           messageId: msg.message_id,
         })
       : msg.message_id
@@ -870,7 +885,7 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
       await upsertTelegramMediaGroupCtx({
         kv,
         chatId,
-        mediaGroupId: msg.media_group_id,
+        mediaGroupId,
         text,
         photo: pickLargestTgPhoto(msg),
       })
@@ -894,9 +909,9 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
     let effectiveText = text
     let photoFileId: string | null = null
 
-    if (isMediaGroup && isNonEmptyString(msg.media_group_id)) {
+    if (isMediaGroup) {
       await sleep(900)
-      const ctx = await getTelegramMediaGroupCtx(kv, chatId, msg.media_group_id)
+      const ctx = await getTelegramMediaGroupCtx(kv, chatId, mediaGroupId)
       if (ctx?.text) effectiveText = ctx.text
       if (ctx?.photoFileId) photoFileId = ctx.photoFileId
     }
