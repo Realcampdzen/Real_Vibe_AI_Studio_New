@@ -425,6 +425,8 @@ app.get('/api/debug/nv', async (c) => {
     ok: true,
     env: {
       hasOpenAIKey: Boolean(c.env.OPENAI_API_KEY),
+      hasOpenAIProxyBaseUrl: Boolean(c.env.OPENAI_PROXY_BASE_URL),
+      hasOpenAIProxyToken: Boolean(c.env.OPENAI_PROXY_TOKEN),
       hasKV: Boolean(kv),
       hasVkGroupId: Boolean(c.env.VK_GROUP_ID),
       hasVkSecret: Boolean(c.env.VK_SECRET),
@@ -443,6 +445,7 @@ app.get('/api/debug/nv', async (c) => {
     },
     tg: {
       lastWebhook: await safeGet('nv:tg:lastWebhook'),
+      lastAutoForward: await safeGet('nv:tg:lastAutoForward'),
       lastSendError: await safeGet('nv:tg:lastSendError'),
     },
   })
@@ -502,6 +505,14 @@ async function handleBotChat(
   if (!message) return c.json({ error: 'Message is required' }, 400)
 
   const apiKey = c.env.OPENAI_API_KEY
+  const proxyBaseUrl =
+    typeof c.env.OPENAI_PROXY_BASE_URL === 'string' && c.env.OPENAI_PROXY_BASE_URL.trim().length > 0
+      ? c.env.OPENAI_PROXY_BASE_URL.trim()
+      : undefined
+  const proxyToken =
+    typeof c.env.OPENAI_PROXY_TOKEN === 'string' && c.env.OPENAI_PROXY_TOKEN.trim().length > 0
+      ? c.env.OPENAI_PROXY_TOKEN.trim()
+      : undefined
 
   if (!apiKey) {
     const reply = fallback(message)
@@ -509,7 +520,7 @@ async function handleBotChat(
   }
 
   try {
-    const reply = (await callOpenAI(apiKey, systemPrompt, message)) || fallback(message)
+    const reply = (await callOpenAI(apiKey, systemPrompt, message, { baseUrl: proxyBaseUrl, proxyToken })) || fallback(message)
     return c.json({ reply, response: reply })
   } catch (err) {
     console.error('Chat API error:', err)
@@ -530,13 +541,25 @@ async function handleBotChat(
   }
 }
 
-async function callOpenAI(apiKey: string, systemPrompt: string, message: string): Promise<string> {
-  const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+async function callOpenAI(
+  apiKey: string,
+  systemPrompt: string,
+  message: string,
+  opts?: { baseUrl?: string; proxyToken?: string },
+): Promise<string> {
+  const normalizedBaseUrl =
+    typeof opts?.baseUrl === 'string' && opts.baseUrl.trim().length > 0 ? opts.baseUrl.trim().replace(/\/+$/, '') : 'https://api.openai.com'
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+  }
+  if (typeof opts?.proxyToken === 'string' && opts.proxyToken.trim().length > 0) {
+    headers['X-Proxy-Token'] = opts.proxyToken.trim()
+  }
+
+  const openaiResponse = await fetch(`${normalizedBaseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers,
     body: JSON.stringify({
       model: MODEL,
       messages: [

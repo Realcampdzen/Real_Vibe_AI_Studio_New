@@ -52,6 +52,7 @@ type TgMessage = {
   from?: { id: number; is_bot?: boolean; first_name?: string; username?: string }
   text?: string
   caption?: string
+  media_group_id?: string
   photo?: Array<{ file_id: string; file_unique_id: string; width: number; height: number; file_size?: number }>
   is_automatic_forward?: boolean
   forward_from_chat?: { id: number; type?: string; title?: string; username?: string }
@@ -80,6 +81,13 @@ function normalizeOutgoingText(text: string, maxChars: number): string {
   for (const emoji of FORBIDDEN_EMOJIS) {
     cleaned = cleaned.replace(new RegExp(emoji.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '')
   }
+
+  // Запрещённая конструкция “не только …, но и …” → заменяем на прямое перечисление (без дополнительного вызова LLM)
+  // Пример: "не только про X, но и про Y" -> "и про X, и про Y"
+  cleaned = cleaned.replace(/\bне\s+только\b([^\n]{0,220}?)\bно\s+и\b/gi, (_m, mid: string) => {
+    const safeMid = typeof mid === 'string' ? mid.replace(/\s*$/, ' ') : ' '
+    return `и${safeMid}и`
+  })
   
   return truncate(cleaned, maxChars)
 }
@@ -188,18 +196,51 @@ async function selectBadgeCandidate(params: {
   return picked
 }
 
-function buildMessagesForNewPost(platform: 'vk' | 'tg', postText: string): OpenAIChatMessage[] {
+const NV_SOCIAL_QUALITY_GUIDE =
+  'Качество: добавь 1 конкретную мысль/пример по теме. Свяжи с 4K-навыками/софт-скиллами/ИИ (если уместно). Без воды.'
+
+const NV_SOCIAL_STYLE_BANS =
+  'Речь: НЕ используй конструкцию «не только …, но и …». Старайся не строить текст на постоянных противопоставлениях.'
+
+const NV_SOCIAL_CTA_PLAYBOOK =
+  'CTA: если задаёшь вопрос (максимум 1), сделай его умным и конкретным. Выбери один тип: вопрос-выбор (2 варианта); мини-кейс "как бы вы поступили"; микрозадание на день; просьба поделиться практикой/инструментом; вопрос через призму 4K-навыков. Не задавай банальные "что запомнилось/как вам".'
+
+function buildMessagesForNewPost(
+  platform: 'vk' | 'tg',
+  postText: string,
+  imageUrl?: string | null,
+): OpenAIChatMessage[] {
   const clipped = truncate(postText.trim(), 1800)
+  const hasImage = isNonEmptyString(imageUrl)
+
+  const userContent: OpenAIChatMessage['content'] = hasImage
+    ? [
+        ...(clipped
+          ? [{ type: 'text' as const, text: `Текст поста:\n${clipped}` }]
+          : [
+              {
+                type: 'text' as const,
+                text: 'Это пост с изображением без текста. Проанализируй изображение и напиши полезный комментарий, связанный с темами лагеря (4K навыки, софт-скиллы, ИИ для обучения и творчества).',
+              },
+            ]),
+        { type: 'image_url' as const, image_url: { url: imageUrl!.trim() } },
+      ]
+    : `Текст поста:\n${clipped}`
+
   return [
     { role: 'system', content: NEUROVALYUSHA_SOCIAL_SYSTEM },
     {
       role: 'system',
       content:
         platform === 'vk'
-          ? 'СЕЙЧАС: напиши один комментарий к новому посту ВК (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.'
-          : 'СЕЙЧАС: напиши один комментарий к новому посту в Telegram (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.',
+          ? `СЕЙЧАС: напиши один комментарий к новому посту ВК (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown).${
+              hasImage ? ' Учитывай изображение; если текста нет — опирайся на изображение.' : ''
+            } В конце можно 1 вопрос. ${NV_SOCIAL_QUALITY_GUIDE} ${NV_SOCIAL_STYLE_BANS} ${NV_SOCIAL_CTA_PLAYBOOK}`
+          : `СЕЙЧАС: напиши один комментарий к новому посту в Telegram (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown).${
+              hasImage ? ' Учитывай изображение; если текста нет — опирайся на изображение.' : ''
+            } В конце можно 1 вопрос. ${NV_SOCIAL_QUALITY_GUIDE} ${NV_SOCIAL_STYLE_BANS} ${NV_SOCIAL_CTA_PLAYBOOK}`,
     },
-    { role: 'user', content: `Текст поста:\n${clipped}` },
+    { role: 'user', content: userContent },
   ]
 }
 
@@ -213,8 +254,8 @@ function buildMessagesForReply(
       role: 'system',
       content:
         platform === 'vk'
-          ? 'СЕЙЧАС: ответь как комментарий ВК, учитывая контекст переписки выше. 1–3 коротких абзаца, 150–700 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.'
-          : 'СЕЙЧАС: ответь как комментарий в Telegram, учитывая контекст переписки выше. 1–3 коротких абзаца, 150–700 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова.',
+          ? `СЕЙЧАС: ответь как комментарий ВК, учитывая контекст переписки выше. 1–3 коротких абзаца, 150–700 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова. ${NV_SOCIAL_STYLE_BANS} Если задаёшь вопрос — максимум 1, конкретный, не шаблонный.`
+          : `СЕЙЧАС: ответь как комментарий в Telegram, учитывая контекст переписки выше. 1–3 коротких абзаца, 150–700 знаков, 0–3 эмодзи, без markdown. Не повторяй дословно чужие слова. ${NV_SOCIAL_STYLE_BANS} Если задаёшь вопрос — максимум 1, конкретный, не шаблонный.`,
     },
     ...memory.map((m) => ({ role: m.role, content: m.content })),
   ]
@@ -276,6 +317,67 @@ export function isValidVkRequest(env: NeuroValyushaBindings, payload: VkCallback
   return true
 }
 
+function pickBestVkPhotoUrlFromAttachments(attachments: any): string | null {
+  if (!Array.isArray(attachments)) return null
+  let bestUrl: string | null = null
+  let bestScore = -1
+
+  for (const att of attachments) {
+    const type = att?.type
+    if (type !== 'photo') continue
+    const sizes = att?.photo?.sizes
+    if (!Array.isArray(sizes)) continue
+
+    for (const s of sizes) {
+      const url = typeof s?.url === 'string' ? s.url.trim() : ''
+      if (!url) continue
+      const w = typeof s?.width === 'number' && Number.isFinite(s.width) ? s.width : 0
+      const h = typeof s?.height === 'number' && Number.isFinite(s.height) ? s.height : 0
+      const score = w * h
+      if (score > bestScore) {
+        bestScore = score
+        bestUrl = url
+      }
+    }
+  }
+
+  return bestUrl
+}
+
+async function vkTryFetchBestPostPhotoUrl(params: {
+  accessToken: string
+  ownerId: number
+  postId: number
+}): Promise<string | null> {
+  const { accessToken, ownerId, postId } = params
+  try {
+    const qs = new URLSearchParams()
+    qs.set('posts', `${ownerId}_${postId}`)
+    qs.set('extended', '0')
+    qs.set('access_token', accessToken)
+    qs.set('v', '5.199')
+
+    const res = await fetch('https://api.vk.com/method/wall.getById', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+      body: qs.toString(),
+    })
+    if (!res.ok) return null
+    const text = await res.text().catch(() => '')
+    const data = (() => {
+      try {
+        return JSON.parse(text) as any
+      } catch {
+        return null
+      }
+    })()
+    const post = Array.isArray(data?.response) ? data.response[0] : null
+    return pickBestVkPhotoUrlFromAttachments(post?.attachments)
+  } catch {
+    return null
+  }
+}
+
 export async function processVkCallbackEvent(env: NeuroValyushaBindings, payload: VkCallbackPayload): Promise<void> {
   const kv = env.NEUROVALYUSHA_KV
   const type = payload.type || ''
@@ -324,6 +426,12 @@ export async function processVkCallbackEvent(env: NeuroValyushaBindings, payload
       return
     }
 
+    // Best-effort: include one image for better quality parity with Telegram (no proxy, still a single OpenAI call)
+    let imageUrl: string | null = pickBestVkPhotoUrlFromAttachments(object?.attachments)
+    if (!imageUrl) {
+      imageUrl = await vkTryFetchBestPostPhotoUrl({ accessToken: env.VK_ACCESS_TOKEN, ownerId, postId })
+    }
+
     const postKey = `nv:vk:post:${ownerId}:${postId}:commented`
     const already = await kvGetText(kv, postKey)
     if (already) {
@@ -353,7 +461,7 @@ export async function processVkCallbackEvent(env: NeuroValyushaBindings, payload
     })
 
     const aiMessages = [
-      ...buildMessagesForNewPost('vk', postText || ''),
+      ...buildMessagesForNewPost('vk', postText || '', imageUrl),
       ...(selectedBadge
         ? [
             {
@@ -602,6 +710,87 @@ async function getTelegramFileUrl(botToken: string, fileId: string): Promise<str
 
 // ---------------- Telegram ----------------
 
+async function getOrUpdateTelegramMediaGroupRootId(params: {
+  kv: KVNamespace | undefined
+  chatId: number
+  mediaGroupId: string
+  messageId: number
+}): Promise<number> {
+  const { kv, chatId, mediaGroupId, messageId } = params
+  const key = `nv:tg:mediaRoot:${chatId}:${mediaGroupId}`
+  const existingRaw = await kvGetText(kv, key)
+  const existing = existingRaw ? Number(existingRaw) : NaN
+  const next = Number.isFinite(existing) && existing > 0 ? Math.min(existing, messageId) : messageId
+  // Keep for a while to unify replies across album items
+  await kvPutText(kv, key, String(next), { ttlSeconds: 60 * 60 * 24 * 60 })
+  return next
+}
+
+function computeTelegramPostIdentity(msg: TgMessage): string {
+  if (isNonEmptyString(msg.media_group_id)) return `mg:${msg.media_group_id}`
+  if (typeof msg.forward_from_message_id === 'number' && Number.isFinite(msg.forward_from_message_id)) {
+    return `fwd:${msg.forward_from_message_id}`
+  }
+  return `msg:${msg.message_id}`
+}
+
+type TgMediaGroupCtx = {
+  text?: string
+  photoFileId?: string
+  photoScore?: number
+  updatedAt?: number
+}
+
+function pickLargestTgPhoto(msg: TgMessage): { file_id: string; score: number } | null {
+  if (!Array.isArray(msg.photo) || msg.photo.length === 0) return null
+  const largest = msg.photo[msg.photo.length - 1]
+  const score = typeof largest.file_size === 'number' && Number.isFinite(largest.file_size) ? largest.file_size : largest.width * largest.height
+  return { file_id: largest.file_id, score }
+}
+
+async function upsertTelegramMediaGroupCtx(params: {
+  kv: KVNamespace | undefined
+  chatId: number
+  mediaGroupId: string
+  text: string
+  photo: { file_id: string; score: number } | null
+}): Promise<void> {
+  const { kv, chatId, mediaGroupId, text, photo } = params
+  if (!kv) return
+  const key = `nv:tg:mediaCtx:${chatId}:${mediaGroupId}`
+  const existing = (await kvGetJson<TgMediaGroupCtx>(kv, key)) ?? {}
+  const next: TgMediaGroupCtx = { ...existing, updatedAt: nowTs() }
+
+  const t = (text || '').trim()
+  if (t) {
+    const existingText = typeof existing.text === 'string' ? existing.text : ''
+    // Prefer the longer non-empty caption/text (albums sometimes carry caption on only one item)
+    if (!existingText || t.length > existingText.length) next.text = t
+  }
+
+  if (photo) {
+    const existingScore = typeof existing.photoScore === 'number' && Number.isFinite(existing.photoScore) ? existing.photoScore : -1
+    if (!existing.photoFileId || photo.score > existingScore) {
+      next.photoFileId = photo.file_id
+      next.photoScore = photo.score
+    }
+  }
+
+  await kvPutJson(kv, key, next, { ttlSeconds: 60 * 30 })
+}
+
+async function getTelegramMediaGroupCtx(
+  kv: KVNamespace | undefined,
+  chatId: number,
+  mediaGroupId: string,
+): Promise<TgMediaGroupCtx | null> {
+  return await kvGetJson<TgMediaGroupCtx>(kv, `nv:tg:mediaCtx:${chatId}:${mediaGroupId}`)
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
 export function isValidTelegramRequest(env: NeuroValyushaBindings, secretHeader: string | undefined): boolean {
   if (!isNonEmptyString(env.TELEGRAM_WEBHOOK_SECRET)) {
     // If secret is not configured, allow (dev), but production should set it.
@@ -646,32 +835,103 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
       if (!expected || !actual || expected !== actual) return
     }
 
-    const rootId = msg.message_id
-    const postKey = `nv:tg:post:${chatId}:${rootId}:commented`
-    const already = await kvGetText(kv, postKey)
-    if (already) return
+    const postIdentity = computeTelegramPostIdentity(msg)
+    const postKey = `nv:tg:post:${chatId}:${postIdentity}:commented`
 
-    // Получаем фото, если есть (берем самое большое)
+    const isMediaGroup = isNonEmptyString(msg.media_group_id)
+
+    // For albums: unify all items into a single root so replies map to one thread
+    const rootId = isMediaGroup
+      ? await getOrUpdateTelegramMediaGroupRootId({
+          kv,
+          chatId,
+          mediaGroupId: msg.media_group_id,
+          messageId: msg.message_id,
+        })
+      : msg.message_id
+
+    // Map this message to the computed root for nested replies
+    await kvPutText(kv, `nv:tg:root:${chatId}:${msg.message_id}`, String(rootId), { ttlSeconds: 60 * 60 * 24 * 60 })
+
+    const debugBase = {
+      ts: nowTs(),
+      update_id: updateId,
+      chatId,
+      channelId: msg.forward_from_chat?.id,
+      message_id: msg.message_id,
+      forward_from_message_id: msg.forward_from_message_id,
+      media_group_id: msg.media_group_id,
+      postIdentity,
+      rootId,
+    }
+
+    // Albums: buffer caption/text + best photo across items so the single comment can use both
+    if (isMediaGroup) {
+      await upsertTelegramMediaGroupCtx({
+        kv,
+        chatId,
+        mediaGroupId: msg.media_group_id,
+        text,
+        photo: pickLargestTgPhoto(msg),
+      })
+    }
+
+    // Strictly one comment per post identity (album or single post)
+    const already = await kvGetText(kv, postKey)
+    if (already) {
+      await kvPutJson(kv, 'nv:tg:lastAutoForward', { ...debugBase, decision: 'skip_already', existing: already }, { ttlSeconds: 60 * 60 * 24 * 14 })
+      return
+    }
+
+    // Quick lock to prevent bursts (e.g., albums producing multiple forwarded messages)
+    // We reuse the same key with a short TTL; on success it will be overwritten with the sent message_id and long TTL.
+    if (await kvIsDuplicate(kv, postKey, { ttlSeconds: 120 })) {
+      await kvPutJson(kv, 'nv:tg:lastAutoForward', { ...debugBase, decision: 'skip_locked' }, { ttlSeconds: 60 * 60 * 24 * 14 })
+      return
+    }
+
+    // For albums: give other items a brief moment to arrive and populate KV context (caption may be on a different item)
+    let effectiveText = text
+    let photoFileId: string | null = null
+
+    if (isMediaGroup && isNonEmptyString(msg.media_group_id)) {
+      await sleep(900)
+      const ctx = await getTelegramMediaGroupCtx(kv, chatId, msg.media_group_id)
+      if (ctx?.text) effectiveText = ctx.text
+      if (ctx?.photoFileId) photoFileId = ctx.photoFileId
+    }
+
+    if (!photoFileId) {
+      const picked = pickLargestTgPhoto(msg)
+      photoFileId = picked?.file_id ?? null
+    }
+
+    // Получаем URL фото (если есть)
     let imageUrl: string | null = null
-    if (Array.isArray(msg.photo) && msg.photo.length > 0 && env.TELEGRAM_BOT_TOKEN) {
+    if (photoFileId && env.TELEGRAM_BOT_TOKEN) {
       try {
-        // Берем последний элемент (самое большое фото)
-        const largestPhoto = msg.photo[msg.photo.length - 1]
-        imageUrl = await getTelegramFileUrl(env.TELEGRAM_BOT_TOKEN, largestPhoto.file_id)
+        imageUrl = await getTelegramFileUrl(env.TELEGRAM_BOT_TOKEN, photoFileId)
       } catch {
-        // Игнорируем ошибки получения URL изображения
         imageUrl = null
       }
     }
 
     // Если нет ни текста, ни изображения - пропускаем
-    if (!text && !imageUrl) return
+    if (!effectiveText && !imageUrl) {
+      await kvPutJson(
+        kv,
+        'nv:tg:lastAutoForward',
+        { ...debugBase, decision: 'skip_no_content', hasImage: Boolean(imageUrl), textChars: effectiveText.length },
+        { ttlSeconds: 60 * 60 * 24 * 14 },
+      )
+      return
+    }
 
     const conversationKey = `nv:tg:conv:${chatId}:${rootId}`
 
     await appendConversationMemory(kv, conversationKey, {
       role: 'user',
-      content: `Пост (Telegram): ${truncate(text || '(пост с изображением)', 1800)}`,
+      content: `Пост (Telegram): ${truncate(effectiveText || '(пост с изображением)', 1800)}`,
       ts: nowTs(),
     })
 
@@ -679,19 +939,19 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
       env,
       kv,
       platform: 'tg',
-      searchText: text || '',
+      searchText: effectiveText || '',
     })
 
     // Формируем контент для LLM: текст + изображение (если есть)
     const userContent: Array<{ type: 'text' | 'image_url'; text?: string; image_url?: { url: string } }> = []
     
-    if (text) {
-      userContent.push({ type: 'text', text: `Текст поста:\n${truncate(text, 1800)}` })
+    if (effectiveText) {
+      userContent.push({ type: 'text', text: `Текст поста:\n${truncate(effectiveText, 1800)}` })
     }
     
     if (imageUrl) {
       userContent.push({ type: 'image_url', image_url: { url: imageUrl } })
-      if (!text) {
+      if (!effectiveText) {
         // Если только фото без текста, добавляем инструкцию
         userContent.unshift({ type: 'text', text: 'Это пост с изображением без текста. Проанализируй изображение и напиши полезный комментарий, связанный с темами лагеря (4K навыки, софт-скиллы, ИИ для обучения и творчества).' })
       }
@@ -701,9 +961,9 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
       { role: 'system', content: NEUROVALYUSHA_SOCIAL_SYSTEM },
       {
         role: 'system',
-        content: imageUrl
-          ? 'СЕЙЧАС: напиши один комментарий к посту в Telegram с изображением (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). Проанализируй изображение и свяжи его с темами лагеря (4K навыки, софт-скиллы, ИИ для обучения и творчества). В конце можно 1 вопрос.'
-          : 'СЕЙЧАС: напиши один комментарий к новому посту в Telegram (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown). В конце можно 1 вопрос.',
+        content: `СЕЙЧАС: напиши один комментарий к новому посту в Telegram (1–3 коротких абзаца, 300–700 знаков, 0–3 эмодзи, без markdown).${
+          imageUrl ? ' Учитывай изображение; если текста нет — опирайся на изображение.' : ''
+        } В конце можно 1 вопрос. ${NV_SOCIAL_QUALITY_GUIDE} ${NV_SOCIAL_STYLE_BANS} ${NV_SOCIAL_CTA_PLAYBOOK}`,
       },
       ...(selectedBadge
         ? [
@@ -733,6 +993,7 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
     })
 
     if (sent?.message_id) {
+      // Upgrade lock -> commented marker
       await kvPutText(kv, postKey, String(sent.message_id), { ttlSeconds: 60 * 60 * 24 * 30 })
       await kvPutText(kv, `nv:tg:myMessage:${chatId}:${sent.message_id}`, '1', { ttlSeconds: 60 * 60 * 24 * 60 })
       if (selectedBadge) await pushRecentBadgeId(kv, 'nv:tg:recentBadges', selectedBadge.id)
@@ -740,6 +1001,20 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
 
     await kvPutText(kv, `nv:tg:root:${chatId}:${rootId}`, String(rootId), { ttlSeconds: 60 * 60 * 24 * 60 })
     await appendConversationMemory(kv, conversationKey, { role: 'assistant', content: comment, ts: nowTs() })
+    await kvPutJson(
+      kv,
+      'nv:tg:lastAutoForward',
+      {
+        ...debugBase,
+        decision: sent?.message_id ? 'sent' : 'send_failed',
+        sent_message_id: sent?.message_id,
+        hasImage: Boolean(imageUrl),
+        textChars: effectiveText.length,
+        commentChars: comment.length,
+        commentPreview: comment.slice(0, 160),
+      },
+      { ttlSeconds: 60 * 60 * 24 * 14 },
+    )
     return
   }
 
@@ -810,7 +1085,14 @@ export async function processTelegramUpdate(env: NeuroValyushaBindings, update: 
 
 async function resolveTelegramRootId(kv: KVNamespace | undefined, chatId: number, parent: TgMessage): Promise<number> {
   // If parent is the auto-forward (root), use it
-  if (parent.is_automatic_forward) return parent.message_id
+  if (parent.is_automatic_forward) {
+    if (isNonEmptyString(parent.media_group_id)) {
+      const mapped = await kvGetText(kv, `nv:tg:mediaRoot:${chatId}:${parent.media_group_id}`)
+      const mappedNum = mapped ? Number(mapped) : NaN
+      if (Number.isFinite(mappedNum) && mappedNum > 0) return mappedNum
+    }
+    return parent.message_id
+  }
 
   // Otherwise try to look up stored root mapping
   const mapped = await kvGetText(kv, `nv:tg:root:${chatId}:${parent.message_id}`)
